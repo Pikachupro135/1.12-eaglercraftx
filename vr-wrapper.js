@@ -1,13 +1,14 @@
 // vr-wrapper.js
-// WebXR "big screen" VR for Eaglercraft 1.12 + simple fake VR hands
+// WebXR "big screen" VR for Eaglercraft 1.12
+// + simple fake VR hands
+// + controller -> keyboard movement (WASD + Space)
 
 let gameCanvas = null;
 
-// Try to find the main game canvas that the engine creates
+// find the main game canvas
 function findGameCanvas() {
   const canvases = document.getElementsByTagName('canvas');
   if (canvases.length > 0) {
-    // Assume the first canvas is the game canvas
     gameCanvas = canvases[0];
     console.log('[VR] Found game canvas:', gameCanvas);
     return true;
@@ -15,7 +16,7 @@ function findGameCanvas() {
   return false;
 }
 
-// Poll for the canvas until it appears
+// poll until canvas exists
 const canvasPoll = setInterval(() => {
   if (findGameCanvas()) {
     clearInterval(canvasPoll);
@@ -34,14 +35,21 @@ let quadPositionBuffer;
 let quadTexcoordBuffer;
 let quadTexture;
 
-// controller state for "hands"
+// controller states for hands and movement
 let controllerStates = [];
 
-// Called once after we find the game canvas
+// track which keys we have "pressed" so we can release them correctly
+const keyState = {
+  KeyW: false,
+  KeyA: false,
+  KeyS: false,
+  KeyD: false,
+  Space: false
+};
+
 function setupVR() {
   console.log('[VR] Setting up VR wrapper');
 
-  // Hidden canvas used as the WebXR render target
   glCanvas = document.createElement('canvas');
   glCanvas.width = 2048;
   glCanvas.height = 2048;
@@ -67,7 +75,7 @@ function setupVR() {
   }
 }
 
-// == Shader helpers ==
+// shader helpers
 function createShader(gl, type, source) {
   const s = gl.createShader(type);
   gl.shaderSource(s, source);
@@ -96,7 +104,7 @@ function createProgram(gl, vsSource, fsSource) {
   return prog;
 }
 
-// == Quad + texture from game canvas ==
+// quad + texture from game canvas
 function initQuad() {
   const vsSource = `
     attribute vec2 aPosition;
@@ -153,7 +161,7 @@ function initQuad() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
 
-// Copy the current game canvas into a texture
+// copy game canvas into texture
 function updateGameTexture() {
   if (!gameCanvas) return;
   gl.bindTexture(gl.TEXTURE_2D, quadTexture);
@@ -167,7 +175,7 @@ function updateGameTexture() {
   );
 }
 
-// == WebXR setup ==
+// WebXR setup
 async function initVR() {
   if (!navigator.xr) {
     alert('WebXR not supported in this browser');
@@ -194,6 +202,8 @@ async function initVR() {
     console.log('[VR] Session ended');
     xrSession = null;
     xrRefSpace = null;
+    // release any stuck keys
+    releaseAllKeys();
   });
 
   initQuad();
@@ -201,7 +211,7 @@ async function initVR() {
   xrSession.requestAnimationFrame(onXRFrame);
 }
 
-// Update controller poses each frame
+// controller poses each frame
 function updateControllers(frame) {
   controllerStates = [];
 
@@ -213,25 +223,27 @@ function updateControllers(frame) {
     const gripPose = frame.getPose(inputSource.gripSpace, xrRefSpace);
     if (!gripPose) continue;
 
+    const gp = inputSource.gamepad || null;
+
     controllerStates.push({
       gripPose,
-      handedness: inputSource.handedness || 'unknown'
+      handedness: inputSource.handedness || 'unknown',
+      gamepad: gp
     });
   }
 }
 
-// Map 3D controller position to 2D clip space for a "fake" hand
+// map 3D controller pos to 2D screen pos (fake hands)
 function controllerToScreenPos(pos) {
-  // pos = DOMPointReadOnly with x,y,z in meters
-  const scale = 0.3; // tweak if too big/small
+  const scale = 0.3;
   const x = pos.x * scale;
-  const y = (pos.y - 1.2) * scale; // shift down a bit so they are near center
+  const y = (pos.y - 1.2) * scale;
 
   const clamp = v => Math.max(-0.8, Math.min(0.8, v));
   return { x: clamp(x), y: clamp(y) };
 }
 
-// Draw a simple colored square at an NDC position
+// simple colored square
 function drawHandAt(x, y, color) {
   const size = 0.1;
   const x1 = x - size;
@@ -278,20 +290,84 @@ function drawHandAt(x, y, color) {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
-// Main XR frame loop
+// ====== controller -> keyboard mapping ======
+
+// helper to send key events
+function sendKey(code, type) {
+  const evt = new KeyboardEvent(type, {
+    code,
+    key: code === 'Space' ? ' ' : code[3], // crude: 'KeyW' -> 'W'
+    bubbles: true,
+    cancelable: true
+  });
+  document.dispatchEvent(evt);
+}
+
+// press or release a key if state changed
+function setKey(code, pressed) {
+  if (keyState[code] === pressed) return;
+  keyState[code] = pressed;
+  sendKey(code, pressed ? 'keydown' : 'keyup');
+}
+
+function releaseAllKeys() {
+  for (const code of Object.keys(keyState)) {
+    if (keyState[code]) {
+      setKey(code, false);
+    }
+  }
+}
+
+// use left controller joystick + button0
+function updateMovementFromControllers() {
+  let xAxis = 0;
+  let yAxis = 0;
+  let jumpPressed = false;
+
+  for (const ctrl of controllerStates) {
+    if (!ctrl.gamepad) continue;
+    // pick left hand by handedness if possible
+    if (ctrl.handedness === 'left') {
+      const gp = ctrl.gamepad;
+      // guessing axes[0]=x, axes[1]=y
+      xAxis = gp.axes[0] || 0;
+      yAxis = gp.axes[1] || 0;
+      // button 0 for jump
+      jumpPressed = gp.buttons[0] && gp.buttons[0].pressed;
+      break;
+    }
+  }
+
+  // threshold so slight drift doesn't walk
+  const dead = 0.2;
+  const forward = -yAxis; // -y = forward
+  const strafe = xAxis;
+
+  // W/S
+  setKey('KeyW', forward > dead);
+  setKey('KeyS', forward < -dead);
+
+  // A/D
+  setKey('KeyD', strafe > dead);
+  setKey('KeyA', strafe < -dead);
+
+  // Space for jump
+  setKey('Space', !!jumpPressed);
+}
+
+// main XR frame loop
 function onXRFrame(time, frame) {
   const session = frame.session;
   const pose = frame.getViewerPose(xrRefSpace);
   const glLayer = session.renderState.baseLayer;
 
-  // update controller positions
   updateControllers(frame);
+  updateMovementFromControllers();
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
   gl.clearColor(0.0, 0.0, 0.0, 1.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  // Copy the game canvas into the texture each frame
   updateGameTexture();
 
   if (pose) {
@@ -299,7 +375,7 @@ function onXRFrame(time, frame) {
       const viewport = glLayer.getViewport(view);
       gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
 
-      // Draw the big game screen
+      // draw big screen
       gl.useProgram(quadProgram);
 
       const posLoc = gl.getAttribLocation(quadProgram, 'aPosition');
@@ -320,7 +396,7 @@ function onXRFrame(time, frame) {
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      // Draw "hands" on top as colored squares
+      // draw hands
       for (const ctrl of controllerStates) {
         const p = ctrl.gripPose.transform.position;
         const pos2D = controllerToScreenPos(p);
